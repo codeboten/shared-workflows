@@ -185,7 +185,7 @@ class ReviewerStateTest(unittest.TestCase):
         )
         self.assertFalse(any(reviewer.approved for reviewer in reviewers))
 
-    def test_inline_ownership_includes_approver_and_outsider(self) -> None:
+    def test_author_action_inline_thread_marks_approver_and_outsider(self) -> None:
         prepared = prepare()
         thread = {
             "discussion_id": "inline",
@@ -198,7 +198,7 @@ class ReviewerStateTest(unittest.TestCase):
         reviewers = resolve(
             prepared,
             review_threads=[thread],
-            pending_actions={"inline": {"action": "reviewer"}},
+            pending_actions={"inline": {"action": "author"}},
         )
 
         self.assertEqual(
@@ -206,6 +206,37 @@ class ReviewerStateTest(unittest.TestCase):
             [reviewer.login for reviewer in reviewers],
         )
         self.assertTrue(all(reviewer.open_thread for reviewer in reviewers))
+        self.assertTrue(all(reviewer.unresolved_thread for reviewer in reviewers))
+
+    def test_reviewer_action_inline_thread_does_not_show_open_thread(self) -> None:
+        prepared = prepare([review_event("reviewer", "APPROVED")])
+        thread = {
+            "discussion_id": "inline",
+            "comments": [{"actor": "reviewer", "actor_role": "approver"}],
+        }
+
+        reviewers = resolve(
+            prepared,
+            review_threads=[thread],
+            pending_actions={"inline": {"action": "reviewer"}},
+        )
+
+        self.assertEqual(
+            [
+                ReviewerSummary(
+                    login="reviewer",
+                    approved=True,
+                    unresolved_thread=True,
+                )
+            ],
+            list(reviewers),
+        )
+        self.assertEqual(
+            ["reviewer"],
+            reviewer_logins_for_notification(
+                dashboard_facts(reviewers=reviewers)
+            ),
+        )
 
     def test_inline_ownership_includes_bot_reviewers(self) -> None:
         prepared = prepare()
@@ -231,8 +262,13 @@ class ReviewerStateTest(unittest.TestCase):
                 ReviewerSummary(
                     login="copilot-pull-request-reviewer[bot]",
                     open_thread=True,
+                    unresolved_thread=True,
                 ),
-                ReviewerSummary(login="reviewer[bot]", open_thread=True),
+                ReviewerSummary(
+                    login="reviewer[bot]",
+                    open_thread=True,
+                    unresolved_thread=True,
+                ),
             ],
             list(reviewers),
         )
@@ -310,6 +346,7 @@ class ReviewerStateTest(unittest.TestCase):
             ReviewerSummary(
                 login="bob",
                 open_thread=True,
+                unresolved_thread=True,
                 top_level_feedback=True,
             ),
             reviewers[1],

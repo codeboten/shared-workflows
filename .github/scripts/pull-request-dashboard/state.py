@@ -36,11 +36,10 @@ DELIVERY_VERSIONS_FILE = "delivery-versions.json"
 # current vector, ordinary state loaders may regenerate mismatched disposable
 # caches. Every constant ending in _STATE_VERSION or _REVISION is included.
 # dashboard-state.json: accepted PR routing results and backfill readiness.
-# Versions 14 and 15 describe incompatible state shapes from parallel changes.
-# Version 16 is the pre-persistent-handoff lifecycle shape. An integration that
-# combines the incompatible shapes must assign another version.
-DASHBOARD_STATE_VERSION = 17
-DASHBOARD_STATE_COMPATIBLE_VERSIONS = (11, 12, 13, 16)
+# Version 18 separates author-action badge state from unresolved-thread state.
+# Earlier versions cannot reconstruct the narrower badge state.
+DASHBOARD_STATE_VERSION = 18
+DASHBOARD_STATE_COMPATIBLE_VERSIONS: tuple[int, ...] = ()
 # backfill-state.json: round-robin cursor used by full dashboard refreshes.
 BACKFILL_STATE_VERSION = 3
 # notification-state.json: pending and delivered Slack notification records.
@@ -361,6 +360,10 @@ def _decode_reviewer(value: Any) -> ReviewerSummary:
             value.get("open_thread", _MISSING),
             "facts.reviewers.open_thread",
         ),
+        unresolved_thread=_boolean(
+            value.get("unresolved_thread", _MISSING),
+            "facts.reviewers.unresolved_thread",
+        ),
         top_level_feedback=_boolean(
             value.get("top_level_feedback", _MISSING),
             "facts.reviewers.top_level_feedback",
@@ -376,6 +379,7 @@ def _encode_reviewer(reviewer: ReviewerSummary) -> dict[str, Any]:
         "pending_review": reviewer.pending_review,
         "changes_requested": reviewer.changes_requested,
         "open_thread": reviewer.open_thread,
+        "unresolved_thread": reviewer.unresolved_thread,
         "top_level_feedback": reviewer.top_level_feedback,
     }
 
