@@ -23,26 +23,17 @@ Save the Netlify project ID as a GitHub Actions variable named
 Save a Netlify personal access token as a GitHub Actions secret named
 `NETLIFY_AUTH_TOKEN` in the `shared-workflows` repository.
 
-Queue rollout requires no queue-mode variable or manual Netlify deployment. The
-deployment workflow selects `canary` until the stable pinned repository workflow
-uses the separate publisher-owned delivery-state branch and retains the
-publisher timeout. In that mode, only
-`opentelemetry-java-instrumentation` and `shared-workflows` use the queue.
-
-Merging the promotion pull request updates the stable workflow pin and triggers
-another Netlify deployment. Once that pin contains the queue-compatible
-publisher behavior, the deployment automatically selects `all` and queues every
-accepted targeted webhook refresh.
+Queue rollout requires no queue-mode variable or manual Netlify deployment.
+Every accepted targeted webhook refresh except an `opened` draft pull request
+enters the queue. The drain processes canary repositories with code from the
+default branch and dispatches each coalesced stable item to the targeted
+workflow, which invokes the promoted repository workflow and scripts. Stable and
+canary workers therefore never load each other's dashboard state formats.
 
 The `shared-workflows` Actions token needs `contents: write` so workers can push
 `otelbot/pull-request-dashboard-state/<repository>` and publishers can push
 `otelbot/pull-request-dashboard-delivery/<repository>`. Target-repository app
 permissions do not change.
-
-The drain workflow runs the dashboard scripts from the commit it was dispatched
-at. Before promotion, queued canary repositories therefore exercise the merged
-code while every other repository continues to use direct targeted refreshes and
-the promoted stable workflow.
 
 The queue uses the site-wide `pr-dashboard-queue` store with strong reads and
 ETag-conditional writes. Netlify creates the store on its first write. The drain

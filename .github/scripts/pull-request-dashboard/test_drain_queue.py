@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -11,6 +13,8 @@ from unittest import mock
 
 import drain_queue
 from drain_queue import (
+    DASHBOARD_WORKFLOW_DISPATCH_URL,
+    DashboardWorkflowDispatcher,
     DrainResult,
     GitHubAppTokenClient,
     WaveResult,
@@ -27,6 +31,39 @@ def claim(item_key: str, *, attempts: int = 0) -> Claim:
 
 
 class DrainQueueTest(unittest.TestCase):
+    def test_main_reports_invalid_canary_repositories_json(self) -> None:
+        argv = [
+            "drain_queue.py",
+            "--claims",
+            "claims.json",
+            "--deadline",
+            "1",
+            "--generation",
+            "1",
+            "--worker",
+            "worker",
+            "--endpoint",
+            "https://example.test/queue",
+            "--canary-repositories-json",
+            "{",
+        ]
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(sys, "argv", argv),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as exit_context,
+        ):
+            drain_queue.main()
+
+        self.assertEqual(exit_context.exception.code, 2)
+        self.assertIn(
+            "argument --canary-repositories-json: expected a JSON array of "
+            'repository names, for example ["opentelemetry-java-instrumentation"]',
+            stderr.getvalue(),
+        )
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_stops_without_claiming_when_initial_queue_is_empty(self) -> None:
         claim_wave = mock.Mock()
         process_wave = mock.Mock()
@@ -172,6 +209,8 @@ class DrainQueueTest(unittest.TestCase):
                 "worker",
                 "--endpoint",
                 "https://example.test/queue",
+                "--canary-repositories-json",
+                '["example"]',
             ]
             with (
                 mock.patch.object(drain_queue, "QueueWorkerClient", return_value=client),
@@ -185,6 +224,7 @@ class DrainQueueTest(unittest.TestCase):
                 mock.patch.dict(
                     os.environ,
                     {
+                        "GITHUB_TOKEN": "actions-token",
                         "PR_DASHBOARD_CLIENT_ID": "client",
                         "PR_DASHBOARD_PRIVATE_KEY": "private-key",
                     },
@@ -205,6 +245,88 @@ class DrainQueueTest(unittest.TestCase):
                 }
             ],
         )
+
+
+class WorkflowDispatcherTest(unittest.TestCase):
+    def test_resolves_a_head_to_its_open_pull_request(self) -> None:
+        class Response(io.BytesIO):
+            status = 200
+
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                pass
+
+        def open_request(_request: object, timeout: int) -> Response:
+            self.assertEqual(timeout, 30)
+            return Response(
+                json.dumps(
+                    [
+                        {"number": 9, "state": "closed", "head": {"sha": "a" * 40}},
+                        {"number": 7, "state": "open", "head": {"sha": "a" * 40}},
+                    ]
+                ).encode()
+            )
+
+        dispatcher = DashboardWorkflowDispatcher(
+            "actions-token",
+            opener=open_request,
+        )
+
+        self.assertEqual(
+            dispatcher.resolve_head("stable", "a" * 40, "stable-token"),
+            7,
+        )
+
+    def test_dispatches_the_coalesced_claim_to_the_targeted_workflow(self) -> None:
+        requests: list[tuple[object, int]] = []
+
+        class Response:
+            status = 204
+
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                pass
+
+        def open_request(request: object, timeout: int) -> Response:
+            requests.append((request, timeout))
+            return Response()
+
+        dispatcher = DashboardWorkflowDispatcher(
+            "actions-token",
+            opener=open_request,
+        )
+        dispatcher.dispatch(
+            Claim(
+                "stable#pr:7",
+                3,
+                "stable",
+                7,
+                "",
+                0,
+                ("pull_request_review", "status"),
+            )
+        )
+
+        request, timeout = requests[0]
+        self.assertEqual(request.full_url, DASHBOARD_WORKFLOW_DISPATCH_URL)
+        self.assertEqual(timeout, 30)
+        self.assertEqual(
+            json.loads(request.data),
+            {
+                "ref": "main",
+                "inputs": {
+                    "repository": "stable",
+                    "pr_number": "7",
+                    "head_sha": "",
+                    "trigger_event": "pull_request_review",
+                },
+            },
+        )
+        self.assertEqual(request.get_header("Authorization"), "Bearer actions-token")
 
 
 class TokenClientTest(unittest.TestCase):
@@ -241,6 +363,220 @@ class TokenClientTest(unittest.TestCase):
 
 
 class ProcessClaimWaveTest(unittest.TestCase):
+    def test_dispatches_stable_claim_without_minting_a_target_token(self) -> None:
+        client = mock.Mock()
+        client.call.return_value = {"dispatcher": True}
+        token_client = mock.Mock()
+        dispatched: list[str] = []
+        stable = Claim(
+            "stable#pr:7",
+            3,
+            "stable",
+            7,
+            "",
+            0,
+            ("pull_request_review",),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = process_claim_wave(
+                [stable],
+                Path(directory) / "results.json",
+                client,
+                1,
+                "worker",
+                token_client,
+                canary_repositories=frozenset({"canary"}),
+                configured_repositories=frozenset({"stable"}),
+                resolve_stable_head=mock.Mock(),
+                dispatch_stable=lambda item: dispatched.append(item.item_key),
+                report_limits=lambda *_args, **_kwargs: None,
+            )
+
+        self.assertEqual(dispatched, ["stable#pr:7"])
+        token_client.mint.assert_not_called()
+        self.assertEqual(result, WaveResult(0, ()))
+        acknowledgment = next(
+            call
+            for call in client.call.call_args_list
+            if call.args == ("acknowledge",)
+        )
+        self.assertEqual(acknowledgment.kwargs["itemKey"], "stable#pr:7")
+        self.assertEqual(acknowledgment.kwargs["outcome"], "success")
+
+    def test_coalesces_stable_head_and_pr_claims_before_dispatch(self) -> None:
+        client = mock.Mock()
+        client.call.return_value = {"dispatcher": True}
+        dispatched: list[Claim] = []
+        token_client = mock.Mock()
+        token_client.mint.return_value = "stable-token"
+        direct = Claim(
+            "stable#pr:7",
+            3,
+            "stable",
+            7,
+            "",
+            0,
+            ("pull_request",),
+        )
+        head = Claim(
+            "stable#head:abc",
+            4,
+            "stable",
+            None,
+            "a" * 40,
+            0,
+            ("status",),
+        )
+        resolve_stable_head = mock.Mock(return_value=7)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = process_claim_wave(
+                [direct, head],
+                Path(directory) / "results.json",
+                client,
+                1,
+                "worker",
+                token_client,
+                canary_repositories=frozenset({"canary"}),
+                configured_repositories=frozenset({"stable"}),
+                resolve_stable_head=resolve_stable_head,
+                dispatch_stable=dispatched.append,
+                report_limits=lambda *_args, **_kwargs: None,
+            )
+
+        resolve_stable_head.assert_called_once_with(
+            "stable",
+            "a" * 40,
+            "stable-token",
+        )
+        token_client.mint.assert_called_once_with(["stable"])
+        token_client.revoke.assert_called_once_with("stable-token")
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0].pr_number, 7)
+        self.assertEqual(dispatched[0].head_sha, "")
+        self.assertEqual(
+            dispatched[0].trigger_events,
+            ("pull_request", "status"),
+        )
+        self.assertEqual(result, WaveResult(0, ()))
+        acknowledgments = [
+            call.kwargs
+            for call in client.call.call_args_list
+            if call.args == ("acknowledge",)
+        ]
+        self.assertEqual(
+            [(item["itemKey"], item["outcome"]) for item in acknowledgments],
+            [("stable#pr:7", "success"), ("stable#head:abc", "success")],
+        )
+
+    def test_dead_letters_unconfigured_stable_claim_without_dispatching(self) -> None:
+        client = mock.Mock()
+        client.call.return_value = {"dispatcher": True}
+        dispatch_stable = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = process_claim_wave(
+                [Claim("removed#pr:7", 3, "removed", 7, "", 0)],
+                Path(directory) / "results.json",
+                client,
+                1,
+                "worker",
+                mock.Mock(),
+                canary_repositories=frozenset({"canary"}),
+                configured_repositories=frozenset({"stable"}),
+                resolve_stable_head=mock.Mock(),
+                dispatch_stable=dispatch_stable,
+                report_limits=lambda *_args, **_kwargs: None,
+            )
+
+        dispatch_stable.assert_not_called()
+        self.assertEqual(result, WaveResult(1, ()))
+        acknowledgment = next(
+            call
+            for call in client.call.call_args_list
+            if call.args == ("acknowledge",)
+        )
+        self.assertEqual(acknowledgment.kwargs["outcome"], "dead")
+        self.assertEqual(
+            acknowledgment.kwargs["error"],
+            "repository is not configured: removed",
+        )
+
+    def test_retries_stable_claim_when_workflow_dispatch_fails(self) -> None:
+        client = mock.Mock()
+        client.call.return_value = {"dispatcher": True}
+
+        def fail_dispatch(_claim: Claim) -> None:
+            raise RuntimeError("dispatch unavailable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = process_claim_wave(
+                [Claim("stable#pr:7", 3, "stable", 7, "", 0)],
+                Path(directory) / "results.json",
+                client,
+                1,
+                "worker",
+                mock.Mock(),
+                canary_repositories=frozenset({"canary"}),
+                configured_repositories=frozenset({"stable"}),
+                resolve_stable_head=mock.Mock(),
+                dispatch_stable=fail_dispatch,
+                report_limits=lambda *_args, **_kwargs: None,
+            )
+
+        self.assertEqual(result, WaveResult(0, ("stable#pr:7",)))
+        acknowledgment = next(
+            call
+            for call in client.call.call_args_list
+            if call.args == ("acknowledge",)
+        )
+        self.assertEqual(acknowledgment.kwargs["outcome"], "retry")
+        self.assertIn("dispatch unavailable", acknowledgment.kwargs["error"])
+
+    def test_stops_stable_dispatches_when_lease_is_lost(self) -> None:
+        client = mock.Mock()
+        client.call.return_value = {"dispatcher": True}
+        monitor = mock.Mock(spec=drain_queue.LeaseMonitor)
+        monitor.assert_valid.side_effect = [
+            None,
+            RuntimeError("queue lease heartbeat failed: lease expired"),
+        ]
+        dispatch_stable = mock.Mock()
+        first = Claim("stable#pr:7", 3, "stable", 7, "", 0)
+        second = Claim("stable#pr:8", 3, "stable", 8, "", 0)
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(drain_queue, "LeaseMonitor", return_value=monitor),
+        ):
+            result = process_claim_wave(
+                [first, second],
+                Path(directory) / "results.json",
+                client,
+                1,
+                "worker",
+                mock.Mock(),
+                canary_repositories=frozenset({"canary"}),
+                configured_repositories=frozenset({"stable"}),
+                resolve_stable_head=mock.Mock(),
+                dispatch_stable=dispatch_stable,
+                report_limits=lambda *_args, **_kwargs: None,
+            )
+
+        dispatch_stable.assert_called_once_with(first)
+        self.assertEqual(result, WaveResult(0, ("stable#pr:8",)))
+        acknowledgments = [
+            call.kwargs
+            for call in client.call.call_args_list
+            if call.args == ("acknowledge",)
+        ]
+        self.assertEqual(
+            [(item["itemKey"], item["outcome"]) for item in acknowledgments],
+            [("stable#pr:7", "success"), ("stable#pr:8", "retry")],
+        )
+        self.assertIn("lease expired", acknowledgments[1]["error"])
+
     def test_dead_letters_exhausted_claim_when_token_creation_fails(self) -> None:
         class TokenClient:
             def mint(self, _repositories: list[str]) -> str:
@@ -338,6 +674,10 @@ class ProcessClaimWaveTest(unittest.TestCase):
                 1,
                 "worker",
                 token_client,
+                canary_repositories=frozenset({"removed", "valid"}),
+                configured_repositories=frozenset({"removed", "valid"}),
+                resolve_stable_head=mock.Mock(),
+                dispatch_stable=mock.Mock(),
                 report_limits=lambda *_args, **_kwargs: None,
             )
 
@@ -388,6 +728,10 @@ class ProcessClaimWaveTest(unittest.TestCase):
                 1,
                 "worker",
                 token_client,
+                canary_repositories=frozenset({"example"}),
+                configured_repositories=frozenset({"example"}),
+                resolve_stable_head=mock.Mock(),
+                dispatch_stable=mock.Mock(),
                 report_limits=lambda threshold, token: lifecycle.append(
                     f"report:{threshold}:{token}"
                 ),

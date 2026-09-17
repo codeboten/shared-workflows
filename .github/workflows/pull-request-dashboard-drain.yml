@@ -10,10 +10,9 @@ on:
 
 permissions: {}
 
-# One checkout serves every claimed repository, so the drain always runs the
-# dashboard scripts from this repository's default branch. Queued repositories
-# therefore skip the staged rollout that pull-request-dashboard.yml applies to
-# stable repositories.
+# One checkout serves every claimed repository. Canary claims run the dashboard
+# code from the default branch; stable claims are handed to the targeted
+# workflow, which runs the promoted repository workflow and scripts.
 concurrency:
   group: pull-request-dashboard-queue-drain
   cancel-in-progress: false
@@ -22,6 +21,7 @@ jobs:
   drain:
     if: github.repository == 'open-telemetry/shared-workflows'
     permissions:
+      actions: write
       contents: write
       copilot-requests: write
       id-token: write
@@ -32,6 +32,7 @@ jobs:
       DISPATCHER_GENERATION: ${{ inputs.dispatcher_generation }}
       PR_DASHBOARD_QUEUE_ENDPOINT: https://otel-pull-request-dashboard.netlify.app/.netlify/functions/dashboard-queue-worker
       WORKER_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      CANARY_REPOSITORIES: '["opentelemetry-java-instrumentation", "shared-workflows"]'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -99,7 +100,8 @@ jobs:
             --deadline "$DRAIN_PROCESSING_DEADLINE" \
             --generation "$DISPATCHER_GENERATION" \
             --worker "$WORKER_ID" \
-            --endpoint "$PR_DASHBOARD_QUEUE_ENDPOINT"
+            --endpoint "$PR_DASHBOARD_QUEUE_ENDPOINT" \
+            --canary-repositories-json "$CANARY_REPOSITORIES"
 
       - name: Save classification cache
         if: always() && steps.claim.outcome == 'success' && steps.claim.outputs.count != '0'

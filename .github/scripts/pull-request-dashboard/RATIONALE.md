@@ -73,6 +73,11 @@ the implementation understandable and operationally cheap.
   each repository runs is then visible in the workflow file, a rollback is a
   revert, and the reference stays hash pinned the way every other action
   reference in this repository is.
+- Queue drains are coordinators for both rollout channels. They process canary
+  claims with code from the default branch and hand each coalesced stable claim
+  to the targeted workflow, which invokes the promoted repository workflow.
+  The drain acknowledges stable work only after GitHub accepts that dispatch,
+  so no worker needs to read or migrate another release's dashboard state.
 - A rollback stops a bad change rather than restoring delivery. Downgraded code
   reads newer delivery state as empty, so delivering from it would repeat
   reminders and re-review requests already sent; the delivery version check

@@ -195,24 +195,28 @@ class RolloutWiringTest(unittest.TestCase):
         self.assertIn("DRAIN_PROCESSING_DEADLINE", body)
         self.assertIn("drain_queue.py", body)
         self.assertNotIn("actions/create-github-app-token@", body)
+        self.assertIn("      actions: write", body)
+        self.assertIn('--canary-repositories-json "$CANARY_REPOSITORIES"', body)
+        drain_canary = re.search(
+            r"^ {6}CANARY_REPOSITORIES: '(\[[^']*\])'$",
+            body,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(drain_canary)
+        self.assertEqual(json.loads(drain_canary.group(1)), self.canary)
 
     def test_webhook_deployment_automates_queue_rollout(self) -> None:
         body = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("      - .github/workflows/pull-request-dashboard.yml", body)
         self.assertNotIn("vars.PR_DASHBOARD_QUEUE_MODE", body)
-        self.assertIn("queue_mode=canary", body)
         self.assertIn("queue_mode=all", body)
-        self.assertIn("pull-request-dashboard-delivery", body)
-        canary_default = body.index("queue_mode=canary")
-        stable_guard = body.index("stable_queue_ready=true")
-        all_selection = body.index("queue_mode=all")
+        self.assertNotIn("stable_queue_ready", body)
+        queue_selection = body.index("queue_mode=all")
         environment_remove = body.index("env:unset PR_DASHBOARD_QUEUE_MODE")
         environment_write = body.index(
             'env:set PR_DASHBOARD_QUEUE_MODE "$queue_mode"'
         )
-        self.assertLess(canary_default, stable_guard)
-        self.assertLess(stable_guard, all_selection)
-        self.assertLess(all_selection, environment_remove)
+        self.assertLess(queue_selection, environment_remove)
         self.assertLess(environment_remove, environment_write)
 
 

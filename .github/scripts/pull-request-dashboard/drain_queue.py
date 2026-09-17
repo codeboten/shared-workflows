@@ -7,9 +7,11 @@ import os
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +19,12 @@ from process_queue_batch import (
     SCRIPT_DIR,
     Claim,
     LeaseMonitor,
+    acknowledgment,
     failure_acknowledgments,
     load_claims,
     parse_claims,
     process_claims,
+    resolve_work_items,
 )
 from queue_worker_client import QueueWorkerClient, acknowledge_results
 from report_rate_limits import report_rate_limits
@@ -32,6 +36,11 @@ MAXIMUM_EXCLUSIONS = 500
 MAXIMUM_EXCLUSION_BYTES = 60 * 1024
 MAXIMUM_REPOSITORIES = 4
 TOKEN_HELPER = SCRIPT_DIR / "github_app_token.mjs"
+DASHBOARD_WORKFLOW_DISPATCH_URL = (
+    "https://api.github.com/repos/open-telemetry/shared-workflows/"
+    "actions/workflows/pull-request-dashboard.yml/dispatches"
+)
+CANARY_REPOSITORIES_EXAMPLE = '["opentelemetry-java-instrumentation"]'
 
 
 @dataclass(frozen=True)
@@ -150,6 +159,102 @@ class GitHubAppTokenClient:
         return result
 
 
+class DashboardWorkflowDispatcher:
+    def __init__(
+        self,
+        token: str,
+        *,
+        opener: Callable[..., Any] = urllib.request.urlopen,
+    ) -> None:
+        if not token:
+            raise ValueError("GITHUB_TOKEN is required to dispatch stable dashboard work")
+        self.token = token
+        self.opener = opener
+
+    def resolve_head(
+        self,
+        repository: str,
+        head_sha: str,
+        token: str,
+    ) -> int | None:
+        request = urllib.request.Request(
+            f"https://api.github.com/repos/open-telemetry/{repository}/"
+            f"commits/{head_sha}/pulls",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "pull-request-dashboard-queue-drain",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        try:
+            with self.opener(request, timeout=30) as response:
+                if response.status != 200:
+                    raise RuntimeError(
+                        "head pull request lookup returned "
+                        f"unexpected HTTP status {response.status}"
+                    )
+                pull_requests = json.load(response)
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")[:1000]
+            raise RuntimeError(
+                f"head pull request lookup failed with HTTP {error.code}: {body}"
+            ) from error
+        if not isinstance(pull_requests, list):
+            raise RuntimeError("head pull request lookup returned invalid JSON")
+        matches = sorted(
+            pull_request["number"]
+            for pull_request in pull_requests
+            if isinstance(pull_request, dict)
+            and pull_request.get("state") == "open"
+            and isinstance(pull_request.get("head"), dict)
+            and pull_request["head"].get("sha") == head_sha
+            and isinstance(pull_request.get("number"), int)
+        )
+        return matches[0] if matches else None
+
+    def dispatch(self, claim: Claim) -> None:
+        payload = json.dumps(
+            {
+                "ref": "main",
+                "inputs": {
+                    "repository": claim.repository,
+                    "pr_number": str(claim.pr_number or ""),
+                    "head_sha": claim.head_sha,
+                    "trigger_event": (
+                        claim.trigger_events[0]
+                        if claim.trigger_events
+                        else "pull_request"
+                    ),
+                },
+            }
+        ).encode()
+        request = urllib.request.Request(
+            DASHBOARD_WORKFLOW_DISPATCH_URL,
+            data=payload,
+            method="POST",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+                "User-Agent": "pull-request-dashboard-queue-drain",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        try:
+            with self.opener(request, timeout=30) as response:
+                if response.status != 204:
+                    raise RuntimeError(
+                        "dashboard workflow dispatch returned "
+                        f"unexpected HTTP status {response.status}"
+                    )
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")[:1000]
+            raise RuntimeError(
+                f"dashboard workflow dispatch failed with HTTP {error.code}: {body}"
+            ) from error
+
+
 def child_process_environment() -> dict[str, str]:
     return {
         name: value
@@ -201,11 +306,19 @@ def process_claim_wave(
     worker_id: str,
     token_client: GitHubAppTokenClient,
     *,
+    canary_repositories: frozenset[str],
+    configured_repositories: frozenset[str],
+    resolve_stable_head: Callable[[str, str, str], int | None],
+    dispatch_stable: Callable[[Claim], None],
     report_limits: Callable[..., None] = report_rate_limits,
 ) -> WaveResult:
     claims_by_repository: dict[str, list[Claim]] = defaultdict(list)
+    stable_claims: list[Claim] = []
     for claim in claims:
-        claims_by_repository[claim.repository].append(claim)
+        if claim.repository in canary_repositories:
+            claims_by_repository[claim.repository].append(claim)
+        else:
+            stable_claims.append(claim)
 
     monitor = LeaseMonitor(client, generation, worker_id)
     try:
@@ -228,6 +341,81 @@ def process_claim_wave(
     results: list[dict[str, Any]] = []
     failures: dict[str, Exception] = {}
     try:
+        stable_results = [
+            acknowledgment(
+                claim,
+                "dead",
+                f"repository is not configured: {claim.repository}",
+            )
+            for claim in stable_claims
+            if claim.repository not in configured_repositories
+        ]
+        configured_stable_claims = [
+            claim
+            for claim in stable_claims
+            if claim.repository in configured_repositories
+        ]
+
+        resolution_tokens: dict[str, str] = {}
+        try:
+            def resolve_head(repository: str, head_sha: str) -> int | None:
+                monitor.assert_valid()
+                token = resolution_tokens.get(repository)
+                if token is None:
+                    token = token_client.mint([repository])
+                    resolution_tokens[repository] = token
+                    print(f"::add-mask::{token}")
+                return resolve_stable_head(repository, head_sha, token)
+
+            stable_work, resolved_stable = resolve_work_items(
+                configured_stable_claims,
+                resolve_head,
+            )
+        finally:
+            for token in resolution_tokens.values():
+                try:
+                    report_limits(20, token=token)
+                except Exception as error:
+                    print(
+                        "::warning::GitHub App rate-limit reporting failed: "
+                        f"{error}"
+                    )
+                try:
+                    token_client.revoke(token)
+                except Exception as error:
+                    print(f"::warning::GitHub App token revocation failed: {error}")
+        stable_results.extend(resolved_stable)
+        for item in stable_work:
+            try:
+                monitor.assert_valid()
+                trigger_events = tuple(
+                    dict.fromkeys(
+                        event
+                        for claim in item.claims
+                        for event in claim.trigger_events
+                    )
+                )
+                dispatch_stable(
+                    replace(
+                        item.claims[0],
+                        pr_number=item.pr_number,
+                        head_sha="",
+                        trigger_events=trigger_events,
+                    )
+                )
+            except Exception as error:
+                stable_results.extend(failure_acknowledgments(item.claims, error))
+            else:
+                stable_results.extend(
+                    acknowledgment(claim, "success") for claim in item.claims
+                )
+        acknowledge_results(
+            client,
+            stable_results,
+            {"generation": generation, "workerId": worker_id},
+        )
+        results.extend(stable_results)
+
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=MAXIMUM_REPOSITORIES
         ) as executor:
@@ -331,6 +519,33 @@ def process_repository_claims(
     return results
 
 
+def parse_canary_repositories(value: str) -> frozenset[str]:
+    message = (
+        "expected a JSON array of repository names, for example "
+        f"{CANARY_REPOSITORIES_EXAMPLE}"
+    )
+    try:
+        repositories = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(message) from error
+    if not isinstance(repositories, list) or not all(
+        isinstance(repository, str) and repository for repository in repositories
+    ):
+        raise argparse.ArgumentTypeError(message)
+    return frozenset(repositories)
+
+
+def load_configured_repositories(
+    path: Path = SCRIPT_DIR / "repositories.json",
+) -> frozenset[str]:
+    config = json.loads(path.read_text(encoding="utf-8"))
+    return frozenset(
+        entry["name"]
+        for entry in config
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Drain dashboard queue waves.")
     parser.add_argument("--claims", type=Path, required=True)
@@ -338,12 +553,22 @@ def main() -> int:
     parser.add_argument("--generation", type=int, required=True)
     parser.add_argument("--worker", required=True)
     parser.add_argument("--endpoint", required=True)
+    parser.add_argument(
+        "--canary-repositories-json",
+        dest="canary_repositories",
+        type=parse_canary_repositories,
+        required=True,
+    )
     args = parser.parse_args()
 
     initial_claims = load_claims(args.claims)
+    configured_repositories = load_configured_repositories()
     client = QueueWorkerClient(args.endpoint)
     client_id, private_key = take_github_app_credentials()
     token_client = GitHubAppTokenClient(client_id, private_key)
+    workflow_dispatcher = DashboardWorkflowDispatcher(
+        os.environ.get("GITHUB_TOKEN", "")
+    )
     with tempfile.TemporaryDirectory(prefix="dashboard-waves-") as directory:
         temporary_directory = Path(directory)
 
@@ -365,6 +590,10 @@ def main() -> int:
                 args.generation,
                 args.worker,
                 token_client,
+                canary_repositories=args.canary_repositories,
+                configured_repositories=configured_repositories,
+                resolve_stable_head=workflow_dispatcher.resolve_head,
+                dispatch_stable=workflow_dispatcher.dispatch,
             )
 
         result = drain_queue(
