@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import state_branch
 
@@ -176,6 +176,215 @@ class FetchStateBranchTest(unittest.TestCase):
             stderr=(
                 " ! [rejected] state-branch -> origin/state-branch (non-fast-forward)\n"
             ),
+        )
+
+    @patch.object(state_branch, "temporary_fetch_ref", return_value="refs/temp/fetch")
+    @patch.object(state_branch, "has_state_branch", return_value=False)
+    @patch.object(state_branch, "run")
+    @patch.object(state_branch.time, "sleep")
+    @patch.object(state_branch, "retry_delay_seconds", return_value=0.25)
+    @patch.object(subprocess, "run")
+    def test_recovers_from_transient_fetch_error(
+        self,
+        subprocess_run: object,
+        retry_delay_seconds: object,
+        sleep: object,
+        run: object,
+        _has_state_branch: object,
+        _temporary_fetch_ref: object,
+    ) -> None:
+        subprocess_run.side_effect = [
+            subprocess.CompletedProcess(
+                args=["git", "fetch"],
+                returncode=128,
+                stdout="",
+                stderr="fatal: unable to access repository: The requested URL returned error: 503\n",
+            ),
+            subprocess.CompletedProcess(
+                args=["git", "fetch"],
+                returncode=0,
+                stdout="",
+                stderr="",
+            ),
+        ]
+
+        self.assertTrue(state_branch.fetch_state_branch("state-branch", required=True))
+
+        self.assertEqual(
+            [
+                call(
+                    [
+                        "git",
+                        "fetch",
+                        "--no-write-fetch-head",
+                        "origin",
+                        "state-branch:refs/temp/fetch",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ),
+                call(
+                    [
+                        "git",
+                        "fetch",
+                        "--no-write-fetch-head",
+                        "origin",
+                        "state-branch:refs/temp/fetch",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ),
+            ],
+            subprocess_run.call_args_list,
+        )
+        retry_delay_seconds.assert_called_once_with(1)
+        sleep.assert_called_once_with(0.25)
+        self.assertEqual(
+            [
+                call(
+                    [
+                        "git",
+                        "update-ref",
+                        "refs/remotes/origin/state-branch",
+                        "refs/temp/fetch",
+                    ]
+                ),
+                call(
+                    ["git", "update-ref", "-d", "refs/temp/fetch"],
+                    check=False,
+                ),
+            ],
+            run.call_args_list,
+        )
+
+    @patch.object(state_branch, "temporary_fetch_ref", return_value="refs/temp/fetch")
+    @patch.object(state_branch, "run")
+    @patch.object(state_branch.time, "sleep")
+    @patch.object(state_branch, "retry_delay_seconds", return_value=0.25)
+    @patch.object(subprocess, "run")
+    def test_raises_after_transient_fetch_retries_are_exhausted(
+        self,
+        subprocess_run: object,
+        retry_delay_seconds: object,
+        sleep: object,
+        run: object,
+        _temporary_fetch_ref: object,
+    ) -> None:
+        subprocess_run.return_value = subprocess.CompletedProcess(
+            args=["git", "fetch"],
+            returncode=128,
+            stdout="",
+            stderr="fatal: unable to access repository: Recv failure: Connection was reset\n",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "failed to fetch required"):
+            state_branch.fetch_state_branch("state-branch", required=True)
+
+        self.assertEqual(
+            [
+                call(
+                    [
+                        "git",
+                        "fetch",
+                        "--no-write-fetch-head",
+                        "origin",
+                        "state-branch:refs/temp/fetch",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            ]
+            * 4,
+            subprocess_run.call_args_list,
+        )
+        self.assertEqual(
+            [1, 2, 3],
+            [call.args[0] for call in retry_delay_seconds.call_args_list],
+        )
+        self.assertEqual(3, sleep.call_count)
+        run.assert_called_once_with(
+            ["git", "update-ref", "-d", "refs/temp/fetch"],
+            check=False,
+        )
+
+    @patch.object(state_branch, "temporary_fetch_ref", return_value="refs/temp/fetch")
+    @patch.object(state_branch, "run")
+    @patch.object(state_branch.time, "sleep")
+    @patch.object(subprocess, "run")
+    def test_returns_false_for_missing_optional_branch_without_retry(
+        self,
+        subprocess_run: object,
+        sleep: object,
+        run: object,
+        _temporary_fetch_ref: object,
+    ) -> None:
+        subprocess_run.return_value = subprocess.CompletedProcess(
+            args=["git", "fetch"],
+            returncode=128,
+            stdout="",
+            stderr="fatal: couldn't find remote ref state-branch\n",
+        )
+
+        self.assertFalse(state_branch.fetch_state_branch("state-branch", required=False))
+
+        subprocess_run.assert_called_once_with(
+            [
+                "git",
+                "fetch",
+                "--no-write-fetch-head",
+                "origin",
+                "state-branch:refs/temp/fetch",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        sleep.assert_not_called()
+        run.assert_called_once_with(
+            ["git", "update-ref", "-d", "refs/temp/fetch"],
+            check=False,
+        )
+
+    @patch.object(state_branch, "temporary_fetch_ref", return_value="refs/temp/fetch")
+    @patch.object(state_branch, "run")
+    @patch.object(state_branch.time, "sleep")
+    @patch.object(subprocess, "run")
+    def test_raises_permanent_fetch_error_without_retry(
+        self,
+        subprocess_run: object,
+        sleep: object,
+        run: object,
+        _temporary_fetch_ref: object,
+    ) -> None:
+        subprocess_run.return_value = subprocess.CompletedProcess(
+            args=["git", "fetch"],
+            returncode=128,
+            stdout="",
+            stderr="remote: Permission to repository denied.\nfatal: HTTP 403\n",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Permission to repository denied"):
+            state_branch.fetch_state_branch("state-branch", required=True)
+
+        subprocess_run.assert_called_once_with(
+            [
+                "git",
+                "fetch",
+                "--no-write-fetch-head",
+                "origin",
+                "state-branch:refs/temp/fetch",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        sleep.assert_not_called()
+        run.assert_called_once_with(
+            ["git", "update-ref", "-d", "refs/temp/fetch"],
+            check=False,
         )
 
     @patch.object(state_branch, "temporary_fetch_ref", return_value="refs/temp/fetch")
