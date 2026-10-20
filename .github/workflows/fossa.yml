@@ -15,7 +15,7 @@ permissions: {}
 jobs:
   fossa:
     name: FOSSA scanning
-    if: github.repository_owner == 'open-telemetry'
+    if: ${{ github.repository_owner == 'open-telemetry' && github.event.repository.fork == false }}
     runs-on: ubuntu-slim
     permissions:
       contents: read # for actions/checkout
